@@ -1,0 +1,474 @@
+---
+title: "Predictive Modelling of Mitral Valve Function Improvement After Mini vs Conventional Surgery: A Longitudinal Analysis"
+author: "Huma Kiyani"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+# Introduction
+
+Mitral valve surgery is a common intervention for restoring cardiac function, but post-operative recovery and functional improvement can differ depending on the surgical approach. In this project, we analyse a longitudinal dataset of patients who received either a **mini (minimally invasive)** approach or a **conventional** approach, and were assessed at **baseline** and at **12 months post-surgery**. The clinical outcome of interest is whether **mitral valve functioning improved (Yes/No)** at each visit.
+
+Because the same patient is observed at multiple time points, the data exhibit **within-patient correlation**. Ignoring this dependence can lead to underestimated uncertainty, unstable generalisation, and misleading conclusions. Therefore, this report focuses on predictive modelling methods that are appropriate for longitudinal binary outcomes and critically compares them.
+
+## Research questions
+
+1. **Does the probability of mitral valve improvement change from baseline to 12 months post-surgery?**
+2. **Does improvement differ between mini surgery and conventional surgery, after accounting for patient characteristics (gender and smoking)?**
+3. **Is the change over time different by surgical approach (time × surgery interaction)?**
+4. **Which modelling approach provides the most reliable predictive performance for improvement, while controlling for overfitting and variance?**
+
+## Data summary
+
+The dataset contains **1000 patients**. Each patient has:
+- `Surgery` (Mini / Conventional)
+- `Gender` (Male / Female)
+- `Smoke` (Yes / No)
+- `Mitral.valve.improved.baseline` (Yes / No)
+- `Mitral.valve.improved.post.surgery` (Yes / No)
+
+We reshape the dataset into a **long format** with **2 observations per patient** (baseline and 12-month follow-up), resulting in approximately **2000 rows** for modelling.
+
+## Brief related work
+
+Longitudinal binary outcomes are commonly modelled using:
+- **Generalised Linear Mixed Models (GLMMs)**, which include patient-level random effects to account for correlation and heterogeneity.
+- **Generalised Estimating Equations (GEEs)**, which provide population-average effects with robust standard errors under a working correlation structure.
+
+Both approaches are widely used in medical follow-up studies because they explicitly address repeated measurements and allow clinically interpretable modelling of change over time.
+
+# Methodology
+
+We experiment with at least two predictive analytics techniques:
+
+1. **GEE logistic regression** (population-average, robust)
+2. **GLMM logistic regression** using a random intercept for each patient (subject-specific)
+
+As a baseline comparator (to illustrate the impact of ignoring dependence), we also fit:
+3. **Naïve logistic regression** that treats observations as independent.
+
+Across all models, the response variable is a binary indicator of improvement at a given visit. We include:
+- `time` (baseline vs 12 months)
+- `Surgery`, `Gender`, `Smoke`
+- `time × Surgery` interaction (clinically meaningful because different surgery types may have different improvement trajectories)
+
+## Libraries
+
+```{r}
+library(tidyverse)
+library(lme4)        # GLMM
+library(broom)
+library(broom.mixed)
+library(geepack)     # GEE
+library(pROC)        # AUC/ROC
+library(caret)       # confusion matrix
+library(performance) # diagnostics for mixed models
+```
+
+## Data import and preprocessing
+
+```{r}
+# Prefer a relative path for reproducibility (place the CSV in ./Data/)
+data_path <- "Data/Mitral valve.csv"
+if (!file.exists(data_path)) {
+  # Fallback to the local filename if running from the same folder as the CSV
+  data_path <- "Mitral valve.csv"
+}
+
+raw <- read.csv(data_path)
+
+# The provided file sometimes contains an unnamed first column used as row index
+if (names(raw)[1] == "" | grepl("^X$", names(raw)[1])) {
+  raw <- raw[, -1, drop = FALSE]
+}
+
+raw <- raw %>%
+  mutate(
+    Subject = as.factor(Subject),
+    Surgery = factor(Surgery),
+    Gender  = factor(Gender),
+    Smoke   = factor(Smoke),
+    Mitral.valve.improved.baseline     = factor(Mitral.valve.improved.baseline),
+    Mitral.valve.improved.post.surgery = factor(Mitral.valve.improved.post.surgery)
+  )
+
+# Reshape to long format: 2 rows per Subject
+dat_long <- raw %>%
+  pivot_longer(
+    cols = c(Mitral.valve.improved.baseline, Mitral.valve.improved.post.surgery),
+    names_to = "visit",
+    values_to = "improved"
+  ) %>%
+  mutate(
+    time = ifelse(visit == "Mitral.valve.improved.baseline", 0, 12),
+    time = factor(time, levels = c(0, 12), labels = c("Baseline", "Month12")),
+    improved_bin = ifelse(improved == "Yes", 1, 0)
+  )
+
+# Quick checks
+stopifnot(all(!is.na(dat_long$improved_bin)))
+table(dat_long$time)
+```
+
+## Exploratory summaries
+
+```{r}
+# Overall improvement rate by time
+dat_long %>%
+  group_by(time) %>%
+  summarise(
+    n = n(),
+    improvement_rate = mean(improved_bin)
+  )
+
+# Improvement rate by surgery and time
+dat_long %>%
+  group_by(Surgery, time) %>%
+  summarise(
+    n = n(),
+    improvement_rate = mean(improved_bin),
+    .groups = "drop"
+  )
+```
+
+```{r}
+# Simple figure: improvement rate by Surgery and Time
+dat_long %>%
+  group_by(Surgery, time) %>%
+  summarise(improvement_rate = mean(improved_bin), .groups = "drop") %>%
+  ggplot(aes(x = time, y = improvement_rate, group = Surgery, colour = Surgery)) +
+  geom_line() +
+  geom_point(size = 2) +
+  labs(
+    x = "Visit",
+    y = "Proportion improved",
+    title = "Observed improvement by surgery type over time"
+  ) +
+  theme_minimal()
+```
+
+## Model specifications
+
+### (A) Naïve logistic regression (independence assumption)
+
+This model is included as a contrast: it does not account for within-subject correlation.
+
+```{r}
+m_glm_naive <- glm(
+  improved_bin ~ time * Surgery + Gender + Smoke,
+  family = binomial,
+  data = dat_long
+)
+summary(m_glm_naive)
+```
+
+### (B) GEE logistic regression (population-average)
+
+We use an exchangeable working correlation structure, appropriate when the correlation between repeated measures is similar across time points.
+
+```{r}
+m_gee <- geeglm(
+  improved_bin ~ time * Surgery + Gender + Smoke,
+  id = Subject,
+  family = binomial,
+  corstr = "exchangeable",
+  data = dat_long
+)
+summary(m_gee)
+```
+
+### (C) GLMM logistic regression (subject-specific)
+
+We fit a random intercept to capture patient-to-patient differences in baseline improvement propensity.
+
+```{r}
+m_glmm_full <- glmer(
+  improved_bin ~ time * Surgery + Gender + Smoke + (1 | Subject),
+  family = binomial,
+  data = dat_long,
+  control = glmerControl(optimizer = "bobyqa")
+)
+summary(m_glmm_full)
+```
+
+## Model selection and validation strategy
+
+### Model selection (fixed-effects structure)
+
+For GLMMs, we perform a simple, transparent selection process:
+- Start with the clinically motivated model containing `time`, `Surgery`, `Gender`, `Smoke`, and `time × Surgery`.
+- Compare against a reduced model without the interaction using likelihood ratio testing (LRT) and AIC.
+
+```{r}
+m_glmm_no_int <- glmer(
+  improved_bin ~ time + Surgery + Gender + Smoke + (1 | Subject),
+  family = binomial,
+  data = dat_long,
+  control = glmerControl(optimizer = "bobyqa")
+)
+
+anova(m_glmm_no_int, m_glmm_full)   # LRT
+AIC(m_glmm_no_int, m_glmm_full)
+```
+
+### Train/test split at patient level
+
+To avoid information leakage (same patient appearing in train and test), we split **by Subject**.
+
+```{r}
+set.seed(123)
+
+subjects <- unique(dat_long$Subject)
+train_ids <- sample(subjects, size = round(0.70 * length(subjects)))
+train <- dat_long %>% filter(Subject %in% train_ids)
+test  <- dat_long %>% filter(!Subject %in% train_ids)
+
+# sanity check
+length(intersect(unique(train$Subject), unique(test$Subject)))  # should be 0
+```
+
+### Refit models on training set
+
+```{r}
+m_glm_naive_tr <- glm(
+  improved_bin ~ time * Surgery + Gender + Smoke,
+  family = binomial,
+  data = train
+)
+
+m_gee_tr <- geeglm(
+  improved_bin ~ time * Surgery + Gender + Smoke,
+  id = Subject,
+  family = binomial,
+  corstr = "exchangeable",
+  data = train
+)
+
+m_glmm_tr <- glmer(
+  improved_bin ~ time * Surgery + Gender + Smoke + (1 | Subject),
+  family = binomial,
+  data = train,
+  control = glmerControl(optimizer = "bobyqa")
+)
+```
+
+### Predictions and metrics
+
+We evaluate:
+- **AUC (ROC)** for discrimination
+- **Accuracy, sensitivity, specificity** at a 0.5 probability threshold
+- A brief **calibration check** (predicted vs observed)
+
+For GLMM predictions on unseen subjects, we use `re.form = NA` to predict using fixed effects only.
+
+```{r}
+# predicted probabilities
+test$pred_glm  <- predict(m_glm_naive_tr, newdata = test, type = "response")
+test$pred_gee  <- predict(m_gee_tr, newdata = test, type = "response")
+test$pred_glmm <- predict(m_glmm_tr, newdata = test, type = "response", re.form = NA)
+
+# helper to compute metrics at threshold 0.5
+get_metrics <- function(y_true, p_hat, threshold = 0.5) {
+  y_pred <- factor(ifelse(p_hat >= threshold, 1, 0), levels = c(0,1))
+  y_true <- factor(y_true, levels = c(0,1))
+
+  cm <- caret::confusionMatrix(y_pred, y_true, positive = "1")
+
+  roc_obj <- pROC::roc(y_true, p_hat, quiet = TRUE)
+  auc_val <- as.numeric(pROC::auc(roc_obj))
+
+  tibble(
+    Accuracy = as.numeric(cm$overall["Accuracy"]),
+    Sensitivity = as.numeric(cm$byClass["Sensitivity"]),
+    Specificity = as.numeric(cm$byClass["Specificity"]),
+    AUC = auc_val
+  )
+}
+
+metrics <- bind_rows(
+  get_metrics(test$improved_bin, test$pred_glm)  %>% mutate(Model = "Naïve logistic"),
+  get_metrics(test$improved_bin, test$pred_gee)  %>% mutate(Model = "GEE logistic"),
+  get_metrics(test$improved_bin, test$pred_glmm) %>% mutate(Model = "GLMM logistic")
+) %>%
+  select(Model, everything())
+
+metrics
+```
+
+```{r}
+# ROC curves
+roc_glm  <- roc(test$improved_bin, test$pred_glm, quiet = TRUE)
+roc_gee  <- roc(test$improved_bin, test$pred_gee, quiet = TRUE)
+roc_glmm <- roc(test$improved_bin, test$pred_glmm, quiet = TRUE)
+
+plot(roc_glm, main = "ROC curves on patient-level test set")
+plot(roc_gee, add = TRUE)
+plot(roc_glmm, add = TRUE)
+legend(
+  "bottomright",
+  legend = c("Naïve logistic", "GEE logistic", "GLMM logistic"),
+  lty = 1,
+  cex = 0.9
+)
+```
+
+```{r}
+# Simple calibration check: group into deciles and compare predicted vs observed
+calibration_df <- test %>%
+  mutate(
+    decile = ntile(pred_glmm, 10)
+  ) %>%
+  group_by(decile) %>%
+  summarise(
+    pred_mean = mean(pred_glmm),
+    obs_mean  = mean(improved_bin),
+    n = n(),
+    .groups = "drop"
+  )
+
+calibration_df
+
+ggplot(calibration_df, aes(x = pred_mean, y = obs_mean)) +
+  geom_point(size = 2) +
+  geom_abline(intercept = 0, slope = 1) +
+  labs(
+    x = "Mean predicted probability (GLMM)",
+    y = "Observed proportion improved",
+    title = "Calibration (GLMM): predicted vs observed by decile"
+  ) +
+  theme_minimal()
+```
+
+## Bias, variance, overfitting and underfitting (theory)
+
+**Bias** refers to systematic error due to overly restrictive assumptions (e.g., missing key predictors or imposing the wrong functional form). In this study, an under-specified model (for example, excluding the clinically plausible `time × Surgery` interaction) may increase bias if surgery types genuinely differ in their improvement trajectory.
+
+**Variance** reflects sensitivity to sampling noise. Complex models (many parameters, interactions, or random-effects structures) can yield unstable estimates and predictions, especially if the signal-to-noise ratio is low.
+
+**Overfitting** occurs when a model learns patterns specific to the training sample that do not generalise. In longitudinal data, leakage can inflate apparent performance if the same subject appears in both training and testing sets. We address this by splitting at the patient level.
+
+**Underfitting** happens when the model is too simple to capture the relationship between predictors and outcome. A naïve model that ignores time dependence or interaction effects may underfit and lose predictive accuracy.
+
+# Results
+
+## Model outputs (effect estimates)
+
+To support interpretation, we report odds ratios (OR) with 95% confidence intervals for the GLMM, which is the primary longitudinal model.
+
+```{r}
+glmm_or <- broom.mixed::tidy(m_glmm_tr, effects = "fixed", conf.int = TRUE, exponentiate = TRUE) %>%
+  select(term, estimate, conf.low, conf.high, p.value) %>%
+  rename(
+    OR = estimate,
+    CI_low = conf.low,
+    CI_high = conf.high
+  )
+
+glmm_or
+```
+
+## Predictive performance
+
+The table below summarises test-set predictive performance using patient-level splitting.
+
+```{r}
+metrics
+```
+
+Interpretation:
+- If the naïve logistic model performs similarly to the longitudinal models, it may indicate that correlation is weak or that predictors dominate the signal.
+- If GEE/GLMM outperform naïve logistic, this supports the value of modelling within-subject correlation and heterogeneity.
+- A meaningful difference between GEE and GLMM can occur because GEE estimates population-average effects, whereas GLMM estimates subject-specific effects with random intercepts.
+
+## Evidence of high variance, overfitting, and underfitting
+
+### High variance / overfitting checks
+
+1. **Patient-level split** reduces leakage-based overfitting.
+2. We compare training vs test AUC for the GLMM to detect performance drop-off.
+
+```{r}
+train$pred_glmm <- predict(m_glmm_tr, newdata = train, type = "response")
+auc_train <- as.numeric(auc(roc(train$improved_bin, train$pred_glmm, quiet = TRUE)))
+auc_test  <- as.numeric(auc(roc(test$improved_bin,  test$pred_glmm,  quiet = TRUE)))
+
+tibble(Set = c("Train", "Test"), AUC = c(auc_train, auc_test))
+```
+
+A large gap (high train AUC, much lower test AUC) would be consistent with overfitting or high variance. A small gap supports generalisability.
+
+### Underfitting checks
+
+We examine whether removing the `time × Surgery` interaction meaningfully worsens fit for the GLMM.
+
+```{r}
+# Compare reduced vs full model on training data
+m_glmm_no_int_tr <- glmer(
+  improved_bin ~ time + Surgery + Gender + Smoke + (1 | Subject),
+  family = binomial,
+  data = train,
+  control = glmerControl(optimizer = "bobyqa")
+)
+
+anova(m_glmm_no_int_tr, m_glmm_tr)
+AIC(m_glmm_no_int_tr, m_glmm_tr)
+```
+
+If the interaction improves fit and/or prediction, excluding it may constitute underfitting.
+
+## Parameter tuning and/or ensemble learning
+
+The core models here are parametric and do not require extensive hyperparameter tuning in the same way that machine-learning models (e.g., random forests) do. The key modelling choices are:
+- inclusion of the `time × Surgery` interaction
+- correlation structure in GEE (we used exchangeable)
+- random-effects structure in GLMM (random intercept)
+
+For completeness, a sensitivity analysis can be done by testing alternative correlation structures in GEE or adding a random slope for time in GLMM. In this dataset (two time points), a random intercept model is often sufficient and more stable.
+
+# Conclusions and Suggestions
+
+## Conclusions
+
+This project applied predictive modelling for a longitudinal binary outcome measuring mitral valve function improvement. A key methodological decision was respecting the repeated-measures structure (two observations per patient).
+
+- The **GEE** approach provides population-average estimates with robust standard errors, making it appropriate for inference about overall effects at the population level.
+- The **GLMM** approach models subject-specific differences via random intercepts, which can be beneficial for prediction and for capturing patient heterogeneity.
+- The **naïve logistic** model illustrates what happens when within-patient dependence is ignored; it can produce overly optimistic uncertainty and may underperform when generalising.
+
+In the context of the research questions, the fitted longitudinal models allow us to explicitly assess:
+- the effect of time (baseline vs 12 months),
+- differences by surgery type,
+- and whether surgery type modifies the time trend (interaction).
+
+## Challenges and limitations
+
+- The dataset contains only **two time points**, limiting the ability to estimate more complex temporal dynamics (e.g., non-linear trends) or robust random-slope structures.
+- The outcome is a **binary improvement indicator**, which may compress clinical nuance. More granular measures (e.g., echocardiographic metrics) could support richer predictive modelling.
+- Prediction for unseen subjects in GLMM relies on fixed effects only (random effects are not known for new individuals), which can limit subject-specific prediction accuracy.
+
+## Suggestions for future work
+
+- Collect additional follow-up visits (e.g., 3, 6, 12, 24 months) to model trajectories and evaluate time-varying effects.
+- Add clinically relevant covariates (age, severity, comorbidities, baseline valve function) to reduce bias from omitted variables.
+- Explore non-linear and machine-learning methods with careful patient-level cross-validation, then compare against GLMM/GEE.
+
+# References
+
+- Fitzmaurice, G. M., Laird, N. M., & Ware, J. H. (2011). *Applied Longitudinal Analysis* (2nd ed.). Wiley.
+- McCulloch, C. E., Searle, S. R., & Neuhaus, J. M. (2008). *Generalized, Linear, and Mixed Models* (2nd ed.). Wiley.
+- Hardin, J. W., & Hilbe, J. M. (2013). *Generalized Estimating Equations* (2nd ed.). CRC Press.
+- Kuhn, M., & Johnson, K. (2013). *Applied Predictive Modeling*. Springer.
+
